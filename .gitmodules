@@ -1,6 +1,7 @@
 [submodule "isl"]
 	path = isl
-	url = git://repo.or.cz/isl.git
+	url = ../isl.git
+	branch = toolchain/isl-0.19-branch
 [submodule "osl"]
 	path = osl
-	url = https://github.com/periscop/openscop.git
+	url = ../openscop.git
