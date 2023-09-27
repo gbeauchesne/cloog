@@ -1,8 +1,9 @@
 [submodule "isl"]
 	path = isl
-	url = git://repo.or.cz/isl.git
+	url = ../isl.git
+	branch = toolchain/develop
 	ignore = dirty
 [submodule "osl"]
 	path = osl
-	url = https://github.com/periscop/openscop.git
+	url = ../openscop.git
 	ignore = dirty
