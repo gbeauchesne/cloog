@@ -54,6 +54,7 @@
 #include <osl/util.h>
 #include <osl/body.h>
 #include <osl/extensions/extbody.h>
+#include <osl/extensions/annotation.h>
 #include <osl/statement.h>
 #include <osl/scop.h>
 #endif
@@ -84,6 +85,8 @@ static void pprint_for(struct cloogoptions *options, FILE *dst, int indent,
 		 struct clast_for *f);
 static void pprint_stmt_list(struct cloogoptions *options, FILE *dst, int indent,
 		       struct clast_stmt *s);
+static int pprint_osl_body(struct cloogoptions *options, FILE *dst,
+    struct clast_user_stmt *u);
 
 
 void pprint_name(FILE *dst, struct clast_name *n)
@@ -302,6 +305,7 @@ int pprint_osl_body(struct cloogoptions *options, FILE *dst,
   osl_scop_p scop = options->scop;
   osl_statement_p stmt;
   osl_body_p body;
+  osl_annotation_t* annotations;
 
   if ((scop != NULL) &&
       (osl_statement_number(scop->statement) >= u->statement->number)) {
@@ -316,6 +320,21 @@ int pprint_osl_body(struct cloogoptions *options, FILE *dst,
     if ((body != NULL) &&
         (body->expression != NULL) &&
         (body->iterators != NULL)) {
+
+      annotations = osl_generic_lookup(stmt->extension, OSL_URI_ANNOTATION);
+      /* First print the prefix, if any */
+      if (annotations && annotations->prefix.count) {
+        for (size_t i = 0; i < annotations->prefix.count; ++i) {
+          const int line_type = annotations->prefix.types[i];
+          if (line_type & OSL_ANNOTATION_TEXT_PRAGMA) {
+            fprintf(dst, "#pragma ");
+          }
+          if (line_type & OSL_ANNOTATION_TEXT_USER) {
+            fprintf(dst, "%s\n", annotations->prefix.lines[i]);
+          }
+        }
+      }
+
       expr = osl_util_identifier_substitution(body->expression->string[0],
                                               body->iterators->string);
       tmp = expr;
@@ -334,9 +353,27 @@ int pprint_osl_body(struct cloogoptions *options, FILE *dst,
       }
       fprintf(dst, "\n");
       free(tmp);
+
+      /* Finally, print the suffix, if any */
+      if (annotations && annotations->suffix.count) {
+        for (size_t i = 0; i < annotations->suffix.count; ++i) {
+          const int line_type = annotations->suffix.types[i];
+          if (line_type & OSL_ANNOTATION_TEXT_PRAGMA) {
+            fprintf(dst, "#pragma ");
+          }
+          if (line_type & OSL_ANNOTATION_TEXT_USER) {
+            fprintf(dst, "%s\n", annotations->suffix.lines[i]);
+          }
+        }
+      }
+
       return 1;
     }
   }
+#else
+  (void) options;
+  (void) dst;
+  (void) u;
 #endif
   return 0;
 }
@@ -370,13 +407,17 @@ void pprint_user_stmt(struct cloogoptions *options, FILE *dst,
     int parenthesis_to_close = 0;
     struct clast_stmt *t;
 
-    if (pprint_osl_body(options, dst, u))
-      return;
-    
-    if (u->statement->name)
-	fprintf(dst, "%s", u->statement->name);
-    else
-	fprintf(dst, "S%d", u->statement->number);
+    if(options->callable) {
+        fprintf(dst, "S%d", u->statement->number);
+    } else {
+        if (pprint_osl_body(options, dst, u))
+          return;
+
+        if (u->statement->name)
+            fprintf(dst, "%s", u->statement->name);
+        else
+            fprintf(dst, "S%d", u->statement->number);
+    }
     fprintf(dst, "(");
     for (t = u->substitutions; t; t = t->next) {
 	assert(CLAST_STMT_IS_A(t, stmt_ass));
@@ -446,7 +487,32 @@ void pprint_for(struct cloogoptions *options, FILE *dst, int indent,
             fprintf(dst, "IF_TIME(%s_start = cloog_util_rtclock());\n",
                     (f->time_var_name) ? f->time_var_name : "");
         }
-        if ((f->parallel & CLAST_PARALLEL_OMP) && !(f->parallel & CLAST_PARALLEL_MPI)) {
+        if ((f->parallel & CLAST_PARALLEL_OMP) && (f->parallel & CLAST_PARALLEL_USER)
+               && !(f->parallel & CLAST_PARALLEL_MPI)) {
+            if (f->LB) {
+                fprintf(dst, "lbp=");
+                pprint_expr(options, dst, f->LB);
+                fprintf(dst, ";\n");
+            }
+            if (f->UB) {
+                fprintf(dst, "%*s", indent, "");
+                fprintf(dst, "ubp=");
+                pprint_expr(options, dst, f->UB);
+                fprintf(dst, ";\n");
+            }
+            fprintf(dst, "#pragma %s%s%s%s%s%s%s\n",
+                    (f->user_directive)? f->user_directive : "omp parallel for",
+                    (f->private_vars)? " private(":"",
+                    (f->private_vars)? f->private_vars: "",
+                    (f->private_vars)? ")":"",
+                    (f->reduction_vars)? " reduction(": "",
+                    (f->reduction_vars)? f->reduction_vars: "",
+                    (f->reduction_vars)? ")": "");
+
+            fprintf(dst, "%*s", indent, "");
+        }
+        if ((f->parallel & CLAST_PARALLEL_OMP) && !(f->parallel & CLAST_PARALLEL_MPI)
+               && !(f->parallel & CLAST_PARALLEL_USER)) {
             if (f->LB) {
                 fprintf(dst, "lbp=");
                 pprint_expr(options, dst, f->LB);
@@ -583,8 +649,12 @@ void pprint_stmt_list(struct cloogoptions *options, FILE *dst, int indent,
 		       struct clast_stmt *s)
 {
     for ( ; s; s = s->next) {
-	if (CLAST_STMT_IS_A(s, stmt_root))
+        if (CLAST_STMT_IS_A(s, stmt_root))
+        {
+            if(options->callable && s->next == NULL)
+                fprintf(dst, "%*sS0\n", indent, "");
 	    continue;
+        }
 	fprintf(dst, "%*s", indent, "");
 	if (CLAST_STMT_IS_A(s, stmt_ass)) {
 	    pprint_assignment(options, dst, (struct clast_assignment *) s);

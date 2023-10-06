@@ -3,9 +3,9 @@
 #   /**-------------------------------------------------------------------**
 #    **                              CLooG                                **
 #    **-------------------------------------------------------------------**
-#    **                          check_run.sh                             **
+#    **                           check_hybrid.sh                         **
 #    **-------------------------------------------------------------------**
-#    **                 First version: November 18th 2011                 **
+#    **                 First version: May 11th 2015                      **
 #    **-------------------------------------------------------------------**/
 #
 
@@ -39,17 +39,26 @@
 # individual tests with %, e.g., "'file1 -f -1' 'file2'" becomes
 # "file1%-f%-1 file2".
 special_refactored=`echo "$SPECIAL_OPTIONS" | \
-                    sed "s/' '/#/g"         | \
+                    sed "s/'  *'/#/g"       | \
                     sed 's/ /%/g'           | \
                     sed "s/#/ /g"           | \
                     sed "s/'//g"`
 
-$CHECKER "RUN C" "$FINITE_CLOOGTEST_C" "" "cloog" "c" "run"
+$CHECKER "HYBRID C" "$CLOOGTEST_C" "" "cloog" "c" "hybrid"
 failedtest=$?;
 
-$CHECKER "RUN SPECIAL" "$special_refactored" "" "cloog" "c" "run"
+$CHECKER "HYBRID SPECIAL" "$special_refactored" "" "cloog" "c" "hybrid"
 failedtest=`expr $failedtest + $?`;
 
-$CHECKER "RUN SPECIAL -sh 1" "$special_refactored" "-sh 1" "cloog" "c" "run"
+$CHECKER "HYBRID SPECIAL -sh 1" "$special_refactored" "-sh 1" "cloog" "c" "hybrid"
 failedtest=`expr $failedtest + $?`;
-return $failedtest;
+
+$CHECKER "HYBRID STRIDED" "$CLOOGTEST_STRIDED" "-strides 1" "cloog" "c" "hybrid"
+failedtest=`expr $failedtest + $?`;
+
+if ! [ -z $CLOOGTEST_OPENSCOP ] ; then
+$CHECKER "HYBRID OPENSCOP" "$CLOOGTEST_OPENSCOP" "-openscop" "scop" "c" "hybrid"
+failedtest=`expr $failedtest + $?`;
+fi
+
+exit $failedtest;

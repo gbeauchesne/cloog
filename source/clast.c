@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <stdint.h>
 #include "../include/cloog/cloog.h"
 
 #define ALLOC(type) (type*)malloc(sizeof(type))
@@ -62,7 +63,12 @@ static void insert_block(CloogDomain *domain, CloogBlock *block, int level,
 			 struct clast_stmt ***next, CloogInfos *infos);
 static void insert_loop(CloogLoop * loop, int level,
 			struct clast_stmt ***next, CloogInfos *infos);
+static int clast_expr_is_bigger_constant(struct clast_expr *e1,
+    struct clast_expr *e2);
 
+static int concat_if_new(void **list1, int num1, void *list2, int num2,
+    int size);
+static int list_compare(const int *list1, int num1, const int *list2, int num2);
 
 struct clast_name *new_clast_name(const char *name)
 {
@@ -105,6 +111,37 @@ struct clast_reduction *new_clast_reduction(enum clast_red_type t, int n)
     for (i = 0; i < n; ++i)
 	r->elts[i] = NULL;
     return r;
+}
+
+static void clast_for_bound(struct clast_for* f)
+{
+    cloog_int_t inf_range, one;
+    cloog_int_init(inf_range); cloog_int_init(one);
+    cloog_int_set_si(inf_range, 1000);
+    cloog_int_set_si(one, 1);
+
+    if(f->LB || f->UB)
+    {
+        if(!f->UB)
+        {
+            f->UB = (struct clast_expr*)new_clast_reduction(clast_red_sum, 2);
+            ((struct clast_reduction*)f->UB)->elts[1] = (struct clast_expr*)new_clast_term(one,clast_expr_copy(f->LB));
+            ((struct clast_reduction*)f->UB)->elts[0] = (struct clast_expr*)new_clast_term(inf_range,NULL);
+
+        } else if (!f->LB) {
+            f->LB = (struct clast_expr*)new_clast_reduction(clast_red_sum, 2);
+            cloog_int_neg(inf_range,inf_range);
+            ((struct clast_reduction*)f->LB)->elts[1] = (struct clast_expr*)new_clast_term(one,clast_expr_copy(f->UB));
+            ((struct clast_reduction*)f->LB)->elts[0] = (struct clast_expr*)new_clast_term(inf_range,NULL);
+        }
+    } else {
+        f->UB = (struct clast_expr*)new_clast_term(inf_range, NULL);
+        cloog_int_neg(inf_range,inf_range);
+        f->LB = (struct clast_expr*)new_clast_term(inf_range, NULL);
+    }
+
+    cloog_int_clear(inf_range);
+    cloog_int_clear(one);
 }
 
 static void free_clast_root(struct clast_stmt *s);
@@ -214,6 +251,7 @@ static void free_clast_for(struct clast_stmt *s)
     if (f->private_vars) free(f->private_vars);
     if (f->reduction_vars) free(f->reduction_vars);
     if (f->time_var_name) free(f->time_var_name);
+    if (f->user_directive) free(f->user_directive);
     free(f);
 }
 
@@ -233,11 +271,13 @@ struct clast_for *new_clast_for(CloogDomain *domain, const char *it,
     f->private_vars = NULL;
     f->reduction_vars = NULL;
     f->time_var_name = NULL;
+    f->user_directive = NULL;
     cloog_int_init(f->stride);
     if (stride)
 	cloog_int_set(f->stride, stride->stride);
     else
 	cloog_int_set_si(f->stride, 1);
+
     return f;
 }
 
@@ -535,6 +575,7 @@ static struct clast_expr *clast_expr_copy(struct clast_expr *e)
 static int clast_equal_allow(CloogEqualities *equal, int level, int line,
 				CloogInfos *infos)
 { 
+  (void) line;
   if (level < infos->options->fsp)
   return 0 ;
   
@@ -842,6 +883,7 @@ static void update_lower_bound(struct clast_expr *expr, int level,
 	CloogStride *stride)
 {
     struct clast_term *t;
+    (void) level;
     if (stride->constraint)
 	return;
     if (expr->type != clast_expr_term)
@@ -916,8 +958,10 @@ static struct clast_expr *clast_minmax(CloogConstraintSet *constraints,
 				       int lower_bound, int no_earlier,
 				       CloogInfos *infos)
 {
-    struct clast_minmax_data data = { level, max, guard, lower_bound,
-				      no_earlier, infos };
+    struct clast_minmax_data data = {
+        .level = level, .max = max, .guard = guard, .lower_bound = lower_bound,
+        .no_earlier = no_earlier, .infos = infos,
+    };
   
     data.n = 0;
 
@@ -1009,6 +1053,7 @@ struct clast_guard_data {
 
 static int guard_count_bounds(CloogConstraint *c, void *user)
 {
+    (void) c;
     struct clast_guard_data *d = (struct clast_guard_data *) user;
 
     d->n++;
@@ -1126,7 +1171,9 @@ static void insert_guard(CloogConstraintSet *constraints, int level,
 			 struct clast_stmt ***next, CloogInfos *infos)
 { 
     int total_dim;
-    struct clast_guard_data data = { level, infos, 0 };
+    struct clast_guard_data data = {
+        .level = level, .infos = infos, .n = 0,
+    };
 
     if (!constraints)
 	return;
@@ -1422,7 +1469,10 @@ static int insert_modulo_guard(CloogConstraint *upper,
 {
   int nb_par;
   CloogConstraintSet *set;
-  struct clast_modulo_guard_data data = { lower, level, next, infos, 0 };
+  struct clast_modulo_guard_data data = {
+      .lower = lower, .level = level, .next = next, .infos = infos,
+      .empty = 0,
+  };
 
   cloog_int_init(data.val);
   cloog_constraint_coefficient_get(upper, level-1, &data.val);
@@ -1485,6 +1535,10 @@ static int insert_equation_as_loop(CloogDomain *domain, CloogConstraint *upper,
 	e1 = clast_bound_from_constraint(lower, level, infos->names);
 
     f = new_clast_for(domain, iterator, e1, e2, infos->stride[level-1]);
+
+    if(infos->options->callable)
+        clast_for_bound(f);
+
     **next = &f->stmt;
     *next = &f->body;
 
@@ -1625,6 +1679,8 @@ static void insert_guarded_otl_for(CloogConstraintSet *constraints, int level,
     struct clast_assignment *ass;
     struct clast_guard *guard;
 
+    (void) constraints;
+
     iterator = cloog_names_name_at_level(infos->names, level);
 
     if (infos->options->block) {
@@ -1697,6 +1753,10 @@ static int insert_for(CloogDomain *domain, CloogConstraintSet *constraints,
     iterator = cloog_names_name_at_level(infos->names, level);
 
     f = new_clast_for(domain, iterator, e1, e2, infos->stride[level-1]);
+
+    if(infos->options->callable)
+        clast_for_bound(f);
+
     **next = &f->stmt;
     *next = &f->body;
   }
@@ -1906,12 +1966,14 @@ static int add_if_new(void **list, int num, void *new, int size)
     int i;
 
     for (i=0; i<num; i++) {
-        if (!memcmp((*list) + i*size, new, size)) break;
+        uint8_t* target = *list;
+        if (!memcmp(target + i*size, new, size)) break;
     }
 
     if (i==num) {
         *list = realloc(*list, (num+1)*size);
-        memcpy(*list + num*size, new, size);
+        uint8_t* target = *list;
+        memcpy(target + num*size, new, size);
         return 1;
     }
 

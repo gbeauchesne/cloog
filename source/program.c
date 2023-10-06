@@ -57,7 +57,11 @@
 #include <osl/scop.h>
 #include <osl/extensions/coordinates.h>
 #include <osl/extensions/loop.h>
+#include <osl/extensions/region.h>
 #endif
+
+static int cloog_program_osl_pprint(FILE * file, CloogProgram * program,
+    CloogOptions * options);
 
 /******************************************************************************
  *                          Structure display function                        *
@@ -321,6 +325,7 @@ static void print_scattering_declarations(FILE *file, CloogProgram *program,
         found = 0;
         if (strcmp(names->scattering[i], names->iterators[j]) == 0) {
           found = 1;
+          break;
         }
       }
       if (!found) {
@@ -341,6 +346,7 @@ static void print_scattering_declarations(FILE *file, CloogProgram *program,
 static void print_iterator_declarations(FILE *file, CloogProgram *program,
 	CloogOptions *options)
 {
+    (void) options;
     CloogNames *names = program->names;
 
     print_scattering_declarations(file, program, 2);
@@ -362,6 +368,7 @@ static void print_callable_preamble(FILE *file, CloogProgram *program,
 
     print_macros(file);
 
+    fprintf(file, "#define S0 { hash(0); }\n");
     for (blocklist = program->blocklist; blocklist; blocklist = blocklist->next) {
 	block = blocklist->block;
 	for (statement = block->statement; statement; statement = statement->next) {
@@ -389,6 +396,7 @@ static void print_callable_preamble(FILE *file, CloogProgram *program,
 
 static void print_callable_postamble(FILE *file, CloogProgram *program)
 {
+    (void) program;
     fprintf(file, "}\n"); 
 }
 
@@ -410,8 +418,6 @@ static void print_iterator_declarations_osl(FILE *file, CloogProgram *program,
   osl_coordinates_p co = NULL;
   int i;
   int loopflags = 0;
-  char* vecvar[2] = {"lbv", "ubv"};
-  char* parvar[2] = {"lbp", "ubp"};
 
   osl_scop_p scop = options->scop;
   CloogNames *names = program->names;
@@ -427,11 +433,28 @@ static void print_iterator_declarations_osl(FILE *file, CloogProgram *program,
     print_declarations(file, names->nb_iterators, names->iterators, indent);
   }
 
+  /*
+   * Assigning string literals as follows is illegal in pedantic C:
+   *   char* vecvar[2] = {"lbv", "ubv"};
+   *   char* parvar[2] = {"lbp", "ubp"};
+   */
   loopflags = get_osl_loop_flags(scop);
-  if(loopflags & CLAST_PARALLEL_OMP)
-    print_declarations(file, 2, parvar, indent);
-  if(loopflags & CLAST_PARALLEL_VEC)
-    print_declarations(file, 2, vecvar, indent);
+  if(loopflags & CLAST_PARALLEL_OMP) {
+    char parvar_0[4], parvar_1[4];
+    snprintf(parvar_0, sizeof parvar_0 / sizeof *parvar_0, "lbp");
+    snprintf(parvar_1, sizeof parvar_1 / sizeof *parvar_1, "ubp");
+
+    char* parvar[2] = { parvar_0, parvar_1, };
+    print_declarations(file, 2, (char**) parvar, indent);
+  }
+  if(loopflags & CLAST_PARALLEL_VEC) {
+    char vecvar_0[4], vecvar_1[4];
+    snprintf(vecvar_0, sizeof vecvar_0 / sizeof *vecvar_0, "lbv");
+    snprintf(vecvar_1, sizeof vecvar_1 / sizeof *vecvar_1, "ubv");
+
+    char* vecvar[2] = { vecvar_0, vecvar_1, };
+    print_declarations(file, 2, (char**) vecvar, indent);
+  }
   
   fprintf(file, "\n");
 }
@@ -439,7 +462,8 @@ static void print_iterator_declarations_osl(FILE *file, CloogProgram *program,
 /*
 * add tags clast loops according to information in scop's osl_loop extension
 */
-static int annotate_loops(osl_scop_p program, struct clast_stmt *root){
+static int annotate_loops(osl_scop_p program, struct clast_stmt *root,
+    ClastFilterType filter_type){
 
   int j, nclastloops, nclaststmts;
   struct clast_for **clastloops = NULL;
@@ -455,10 +479,12 @@ static int annotate_loops(osl_scop_p program, struct clast_stmt *root){
     //for each loop
     osl_loop_p loop = ll;
     ClastFilter filter = { loop->iter, loop->stmt_ids, 
-                           loop->nb_stmts, subset};
+                           loop->nb_stmts, filter_type};
 
     clast_filter(root, filter, &clastloops, &nclastloops, 
                  &claststmts, &nclaststmts);
+
+    if (claststmts) { free(claststmts); claststmts=NULL;}
 
     /* There should be at least one */
     if (nclastloops==0) {  //FROM PLUTO
@@ -483,15 +509,37 @@ static int annotate_loops(osl_scop_p program, struct clast_stmt *root){
           clastloops[j]->private_vars = strdup(loop->private_vars);
         }
       }
+
+      if (loop->directive & CLAST_PARALLEL_USER) {
+        clastloops[j]->parallel |= CLAST_PARALLEL_USER;
+        ret |= CLAST_PARALLEL_USER;
+        if (loop->user) {
+          clastloops[j]->user_directive = strdup(loop->user);
+        }
+      }
+
     }
 
     if (clastloops) { free(clastloops); clastloops=NULL;}
-    if (claststmts) { free(claststmts); claststmts=NULL;}
 
     ll = ll->next;
   }
 
   return ret;
+}
+#endif
+
+#if OSL_SUPPORT
+static void cloog_program_pprint_osl_region_text(FILE* stream, osl_region_text_t* text) {
+  for (size_t i = 0; i < text->count; ++i) {
+    const int line_type = text->types[i];
+    if (line_type & OSL_REGION_TEXT_PRAGMA) {
+      fprintf(stream, "#pragma ");
+    }
+    if (line_type & OSL_REGION_TEXT_USER) {
+      fprintf(stream, "%s\n", text->lines[i]);
+    }
+  }
 }
 #endif
 
@@ -520,6 +568,8 @@ int cloog_program_osl_pprint(FILE * file, CloogProgram * program,
   osl_coordinates_p coordinates;
   struct clast_stmt *root;
   FILE* original = NULL;
+  osl_region_t* region = NULL;
+  ClastFilterType filter_type = options->exact_clast_filtering ? exact : subset;
 
   if (scop && !options->compilable && !options->callable) {
 #ifdef CLOOG_RUSAGE
@@ -564,12 +614,36 @@ int cloog_program_osl_pprint(FILE * file, CloogProgram * program,
         fprintf(file, "\n");
     }
 
+    region = osl_generic_lookup(scop->extension, OSL_URI_REGION);
+    if (region) {
+      /* Ensure one of the regions is a global region. */
+      while (region && region->location != OSL_REGION_GLOBAL) {
+        region = region->next;
+      }
+      /* Otherwise, proceed as if there was no region. */
+      if (region && region->location != OSL_REGION_GLOBAL)
+        region = NULL;
+    }
+
+    if (region) {
+      cloog_program_pprint_osl_region_text(file, &region->prefix);
+      fprintf(file, "{\n");
+      cloog_program_pprint_osl_region_text(file, &region->prelude);
+      indentation += INDENT_STEP;
+    }
+
     /* Generate the clast from the pseudo-AST then pretty-print it. */
     root = cloog_clast_create(program, options);
-    annotate_loops(options->scop, root);
+    annotate_loops(options->scop, root, filter_type);
     print_iterator_declarations_osl(file, program, indentation, options);
     clast_pprint(file, root, indentation, options);
     cloog_clast_free(root);
+
+    if (region) {
+      cloog_program_pprint_osl_region_text(file, &region->postlude);
+      fprintf(file, "}\n");
+      cloog_program_pprint_osl_region_text(file, &region->suffix);
+    }
 
     /* Print what was after the SCoP in the original file (if any). */
     if (coordinates) {
@@ -593,6 +667,10 @@ int cloog_program_osl_pprint(FILE * file, CloogProgram * program,
 
     return 1;
   }
+#else
+  (void) file;
+  (void) program;
+  (void) options;
 #endif
   return 0;
 }
